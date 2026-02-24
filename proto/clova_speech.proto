@@ -1,0 +1,85 @@
+syntax = "proto3";
+
+package clovaspeech;
+
+option java_package = "com.ncloud.clovaspeech";
+option java_outer_classname = "ClovaSpeechProto";
+
+// Clova Speech gRPC 실시간 STT 서비스
+service ClovaSpeechService {
+  // 양방향 스트리밍: 오디오 전송 → STT 결과 수신
+  rpc Recognize(stream RecognizeRequest) returns (stream RecognizeResponse);
+}
+
+// STT 요청 메시지 (오디오 청크 or 설정)
+message RecognizeRequest {
+  oneof request {
+    // 최초 요청: 세션 설정
+    RecognizeConfig config = 1;
+    // 이후 요청: 오디오 데이터
+    AudioContent audio_content = 2;
+  }
+}
+
+// STT 세션 설정
+message RecognizeConfig {
+  // 인식 언어 (예: "ko-KR", "en-US")
+  string language_code = 1;
+  // 오디오 인코딩 포맷
+  AudioEncoding encoding = 2;
+  // 샘플링레이트 (Hz)
+  int32 sample_rate_hertz = 3;
+  // 도메인 (general, finance, medical 등)
+  string domain = 4;
+  // 모델 식별자
+  string model = 5;
+  // 부분 결과(partial) 수신 여부
+  bool enable_partial = 6;
+}
+
+// 오디오 인코딩 포맷
+enum AudioEncoding {
+  LINEAR16 = 0;  // 16bit PCM (기본값)
+  FLAC = 1;
+  MULAW = 2;
+}
+
+// 오디오 데이터 청크
+message AudioContent {
+  // 원시 오디오 바이트
+  bytes content = 1;
+}
+
+// STT 응답 메시지
+message RecognizeResponse {
+  // 결과 유형
+  ResultType result_type = 1;
+  // 인식된 텍스트
+  string text = 2;
+  // 신뢰도 (0.0 ~ 1.0)
+  float confidence = 3;
+  // 단어 단위 타임스탬프 목록
+  repeated WordInfo words = 4;
+  // 발화 시작 시각 (ms)
+  int64 start_time_ms = 5;
+  // 발화 종료 시각 (ms)
+  int64 end_time_ms = 6;
+}
+
+// 결과 유형
+enum ResultType {
+  PARTIAL = 0;  // 부분 결과 (발화 중)
+  FINAL = 1;    // 최종 결과 (발화 완료)
+}
+
+// 단어 단위 타임스탬프
+message WordInfo {
+  // 단어 텍스트
+  string word = 1;
+  // 단어 시작 시각 (ms)
+  int64 start_ms = 2;
+  // 단어 종료 시각 (ms)
+  int64 end_ms = 3;
+  // 단어 신뢰도
+  float confidence = 4;
+}

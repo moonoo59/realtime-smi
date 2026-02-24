@@ -1,0 +1,1185 @@
+################################################################################
+# SDI 실시간 자막 시스템 - PM 기술 설계 명세서
+# 작성일: 2026-02-19
+# 버전: 1.0.0
+################################################################################
+
+project:
+  name: "SDI-RealtimeSubtitle"
+  version: "1.0.0"
+  description: >
+    SDI 입력 신호에서 오디오를 추출하고, Clova Speech gRPC STT로 실시간 변환 후
+    비디오 프레임에 자막을 오버레이하여 출력하는 전체 파이프라인 시스템.
+    WER/CER 정확도 측정, 지연시간 계측, 실시간 모니터링 기능을 포함.
+  assumptions:
+    - "Clova Speech gRPC API 엔드포인트 및 인증 토큰은 사전 발급된 것으로 가정"
+    - "Blackmagic DeckLink 카드가 설치된 장비에서는 실제 SDI 신호 사용, 미설치 시 오디오 파일 시뮬레이션 모드로 대체"
+    - "Python 3.11+ 기준으로 구현하며, 성능 병목 발생 시 ctypes/cffi를 통한 C 확장 추가"
+    - "단일 SDI 입력 포트, 단일 STT 세션을 기본 단위로 설계 (다중 포트 확장은 Phase 4)"
+    - "자막 출력은 OpenCV를 통한 프리뷰 창 및 파일 저장 우선 (NDI/SDI 재출력은 Phase 4)"
+    - "터미널 TUI 방식의 대시보드를 기본으로 설계하며, 웹 UI는 Phase 3에서 추가"
+    - "오디오 샘플링: SDI 임베디드 오디오는 48kHz/24bit가 일반적이며, 16kHz/16bit/mono로 리샘플링"
+
+################################################################################
+# 1. 요구사항 분석
+################################################################################
+
+requirements:
+  primary_goal: >
+    SDI 캡처 카드(Blackmagic DeckLink)로부터 비디오/오디오를 동시에 수신하고,
+    임베디드 오디오를 PCM 16kHz/16bit/mono로 변환하여 Clova Speech gRPC API에
+    실시간 스트리밍 전송한다. 수신된 STT 결과(partial/final)를 원본 비디오 프레임에
+    오버레이하여 저지연 자막을 생성하고, WER/CER 정확도와 각 단계별 지연시간을
+    측정하여 운영자가 실시간으로 파이프라인 상태를 모니터링할 수 있는 시스템을 구축한다.
+
+  success_criteria:
+    - "End-to-end 자막 지연시간 2,000ms 이하 (목표: 1,000ms 이하)"
+    - "오디오 캡처 → STT 전송 지연: 200ms 이하"
+    - "STT 전송 → partial 결과 수신: 500ms 이하"
+    - "STT 전송 → final 결과 수신: 1,500ms 이하"
+    - "프레임 드롭율: 1920x1080 30fps 기준 0.1% 이하"
+    - "STT gRPC 연결 성공률: 99% 이상 (자동 재연결 포함)"
+    - "WER 측정 오차: 레퍼런스 대비 ±0.5% 이내"
+    - "시스템 연속 운영 안정성: 8시간 무중단 운영 가능"
+    - "설정 핫스왑: 서비스 중단 없이 10초 이내 파라미터 적용"
+    - "테스트 모드: SDI 하드웨어 없이 오디오 파일로 전체 파이프라인 검증 가능"
+
+  constraints:
+    time: "Phase 1: 3주, Phase 2: 2주, Phase 3: 2주, Phase 4: 3주 (총 10주)"
+    technical:
+      - "Blackmagic Desktop Video SDK 12.x (Python 바인딩: decklink-python 또는 ctypes 직접 바인딩)"
+      - "Clova Speech gRPC SDK - NCP 제공 proto 파일 기준"
+      - "Python 3.11 이상 필수 (asyncio, typing 최신 문법 사용)"
+      - "macOS 13+ 또는 Ubuntu 22.04 LTS 이상"
+      - "OpenCV 4.8+: 자막 오버레이 및 프리뷰"
+      - "Pillow: 한글 폰트 렌더링 (OpenCV 기본 폰트는 한글 미지원)"
+    resources:
+      - "개발자: 1명 (Python 숙련, 일부 C/C++ 읽기 가능)"
+      - "테스트 장비: Blackmagic DeckLink Mini Recorder 4K 권장"
+      - "네트워크: Clova Speech API 접근 가능한 인터넷 환경"
+      - "메모리: 최소 8GB RAM (비디오 버퍼링을 위해 16GB 권장)"
+
+  environment:
+    users: "방송국 기술 엔지니어, QA 테스터, 자막 운영자"
+    deployment: "단일 장비 (맥미니 또는 리눅스 워크스테이션) 로컬 실행"
+    usage_pattern: "생방송 모니터링 시 연속 운영 (4~8시간 연속), 테스트 시 단발성 실행"
+    scale: "단일 SDI 입력 채널, 단일 STT 세션, 동시 사용자 1명"
+
+################################################################################
+# 2. 시스템 아키텍처
+################################################################################
+
+architecture:
+  language: "Python 3.11"
+  language_reason: >
+    Blackmagic SDK ctypes 바인딩, gRPC 클라이언트, OpenCV 자막 렌더링,
+    asyncio 기반 파이프라인 모두 Python 생태계에서 안정적으로 지원됨.
+    빠른 프로토타입과 운영 코드 병행 가능. 오디오 리샘플링(numpy/scipy)과
+    통계 계산도 Python이 유리함. 실제 병목은 C 레벨(DeckLink SDK, OpenCV)에서
+    처리되므로 Python 오버헤드는 허용 범위 내.
+
+  ascii_architecture: |
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │                       SDI-RealtimeSubtitle System                       │
+    │                                                                         │
+    │  ┌──────────────┐     ┌──────────────┐     ┌───────────────────────┐   │
+    │  │  [INPUT]     │     │  [PROCESS]   │     │  [OUTPUT]             │   │
+    │  │              │     │              │     │                       │   │
+    │  │  SDI Signal  │     │  Audio       │     │  Subtitle Overlay     │   │
+    │  │  (or File)   │────▶│  Resampler   │     │  Preview Window       │   │
+    │  │              │  ┌──│  16kHz/16bit │     │  (OpenCV)             │   │
+    │  └──────────────┘  │  │  /mono       │     └───────────────────────┘   │
+    │         │          │  └──────────────┘               ▲                 │
+    │         ▼          │         │                        │                 │
+    │  ┌──────────────┐  │         ▼                ┌───────────────┐        │
+    │  │  DeckLink    │  │  ┌──────────────┐        │  Subtitle     │        │
+    │  │  Capture     │  │  │  gRPC STT    │───────▶│  Compositor   │        │
+    │  │  Module      │──┘  │  Streamer    │        │               │        │
+    │  │              │     │  (Clova)     │        └───────────────┘        │
+    │  │  Video Frame │     └──────────────┘                ▲                │
+    │  │  Audio PCM   │            │                        │                │
+    │  └──────────────┘            ▼                ┌───────────────┐        │
+    │         │           ┌──────────────┐          │  Subtitle     │        │
+    │         │           │  STT Result  │─────────▶│  Manager      │        │
+    │         │           │  Handler     │          │  (partial/    │        │
+    │         │           │  (partial/   │          │   final buf)  │        │
+    │         │           │   final)     │          └───────────────┘        │
+    │         │           └──────────────┘                                   │
+    │         │                                                               │
+    │         ▼                                                               │
+    │  ┌──────────────────────────────────────────────────────────────────┐  │
+    │  │                    CROSS-CUTTING CONCERNS                        │  │
+    │  │  ┌─────────────┐  ┌─────────────┐  ┌────────────┐  ┌────────┐  │  │
+    │  │  │  Metrics &  │  │  Latency    │  │  Accuracy  │  │  Log   │  │  │
+    │  │  │  Dashboard  │  │  Tracker    │  │  (WER/CER) │  │  Save  │  │  │
+    │  │  │  (TUI/Web)  │  │             │  │  Evaluator │  │  SRT   │  │  │
+    │  │  └─────────────┘  └─────────────┘  └────────────┘  └────────┘  │  │
+    │  └──────────────────────────────────────────────────────────────────┘  │
+    │                                                                         │
+    │  ┌──────────────────────────────────────────────────────────────────┐  │
+    │  │                    CONFIGURATION LAYER                           │  │
+    │  │         config.yaml  ──  HotSwap Watcher  ──  Env Vars           │  │
+    │  └──────────────────────────────────────────────────────────────────┘  │
+    └─────────────────────────────────────────────────────────────────────────┘
+
+  modules:
+    - name: "CaptureModule"
+      file: "src/capture/decklink_capture.py"
+      responsibility: >
+        Blackmagic DeckLink SDK(ctypes 바인딩)를 통해 SDI 입력에서 비디오 프레임과
+        임베디드 PCM 오디오를 캡처하여 내부 큐에 전달하는 단일 책임을 가짐.
+        테스트 모드에서는 오디오 파일(WAV/MP3)을 실시간 스트리밍으로 시뮬레이션.
+      key_functions:
+        - "DeckLinkCapture.__init__(config): DeckLink 장치 초기화 및 콜백 등록"
+        - "DeckLinkCapture.start(): 캡처 시작, 비디오/오디오 큐 활성화"
+        - "DeckLinkCapture.stop(): 캡처 종료, 리소스 정리"
+        - "DeckLinkCapture._on_video_frame(frame): 비디오 프레임 수신 콜백, video_queue에 put"
+        - "DeckLinkCapture._on_audio_packet(samples, timestamp): 오디오 패킷 수신 콜백, audio_queue에 put"
+        - "FileMockCapture.simulate(file_path): WAV/MP3 파일을 DeckLink와 동일한 큐 인터페이스로 재생"
+        - "get_video_queue(): asyncio.Queue[VideoFrame] 반환"
+        - "get_audio_queue(): asyncio.Queue[AudioPacket] 반환"
+      interfaces:
+        VideoFrame: "{frame_id: int, timestamp_ns: int, width: int, height: int, pixel_format: str, data: bytes}"
+        AudioPacket: "{packet_id: int, timestamp_ns: int, sample_rate: int, bit_depth: int, channels: int, data: bytes}"
+
+    - name: "AudioResamplerModule"
+      file: "src/audio/resampler.py"
+      responsibility: >
+        캡처된 임베디드 오디오(48kHz/24bit/stereo 등)를 Clova Speech STT가 요구하는
+        16kHz/16bit/mono PCM으로 변환하고, 설정된 chunk_size 단위로 분할하여
+        STT 입력 큐에 전달하는 단일 책임을 가짐.
+      key_functions:
+        - "AudioResampler.__init__(config): 입력 포맷, 출력 포맷, 채널 선택 초기화"
+        - "AudioResampler.resample(audio_packet) -> PCMChunk: numpy+scipy 리샘플링, 채널 믹스다운"
+        - "AudioResampler.apply_gain(data, gain_db) -> bytes: 게인 조정"
+        - "AudioResampler.calculate_rms(data) -> float: RMS 레벨 계산 (모니터링용)"
+        - "AudioResampler.calculate_peak(data) -> float: Peak 레벨 계산"
+        - "AudioResampler.split_chunks(pcm_data, chunk_size) -> list[bytes]: chunk_size 단위 분할"
+        - "VadFilter.is_speech(chunk) -> bool: WebRTC VAD 기반 음성 구간 판별"
+      interfaces:
+        PCMChunk: "{chunk_id: int, capture_timestamp_ns: int, sample_rate: 16000, bit_depth: 16, channels: 1, data: bytes, rms: float, peak: float}"
+
+    - name: "STTStreamerModule"
+      file: "src/stt/clova_streamer.py"
+      responsibility: >
+        PCM 오디오 청크를 Clova Speech gRPC API에 실시간 스트리밍 전송하고,
+        partial/final STT 결과를 수신하여 결과 큐에 전달하는 단일 책임을 가짐.
+        연결 끊김 시 exponential backoff 자동 재연결 포함.
+      key_functions:
+        - "ClovaSpeechStreamer.__init__(config): gRPC 채널 초기화, 인증 메타데이터 설정"
+        - "ClovaSpeechStreamer.connect(): gRPC 채널 연결 및 스트림 세션 생성"
+        - "ClovaSpeechStreamer.stream_audio(pcm_chunk): 오디오 청크를 gRPC 스트림으로 전송"
+        - "ClovaSpeechStreamer._receive_loop(): gRPC 응답 수신 루프 (asyncio task)"
+        - "ClovaSpeechStreamer._reconnect_with_backoff(): 재연결 (1s, 2s, 4s, 8s, max 5회)"
+        - "ClovaSpeechStreamer.disconnect(): 스트림 종료 및 gRPC 채널 닫기"
+        - "ClovaSpeechStreamer.get_result_queue(): asyncio.Queue[STTResult] 반환"
+      interfaces:
+        STTResult:
+          "{result_id: int, type: 'partial'|'final', text: str,
+            send_timestamp_ns: int, receive_timestamp_ns: int,
+            confidence: float, words: list[{word: str, start_ms: int, end_ms: int}]}"
+
+    - name: "SubtitleManagerModule"
+      file: "src/subtitle/subtitle_manager.py"
+      responsibility: >
+        STT 결과(partial/final)를 수신하여 현재 표시할 자막 텍스트를 결정하고,
+        sync_offset 적용 후 비디오 컴포지터에 전달할 자막 이벤트를 관리하며,
+        SRT/VTT 파일로 저장하는 단일 책임을 가짐.
+      key_functions:
+        - "SubtitleManager.__init__(config): 자막 설정(폰트/색상/위치/sync_offset) 초기화"
+        - "SubtitleManager.process_result(stt_result): partial/final 구분 처리, 표시 자막 결정"
+        - "SubtitleManager.get_current_subtitle() -> SubtitleEvent: 현재 프레임에 표시할 자막 반환"
+        - "SubtitleManager.flush_history(n) -> list[SubtitleEvent]: 히스토리 버퍼 조회"
+        - "SubtitleManager.export_srt(filepath): SRT 파일 저장"
+        - "SubtitleManager.export_vtt(filepath): VTT 파일 저장"
+        - "SubtitleManager.update_config(config): 핫스왑 설정 업데이트 (잠금 없이 적용)"
+      interfaces:
+        SubtitleEvent:
+          "{event_id: int, text: str, is_partial: bool,
+            display_at_ns: int, expire_at_ns: int,
+            font: str, font_size: int, color: str, position: {x: float, y: float}}"
+
+    - name: "VideoCompositorModule"
+      file: "src/compositor/video_compositor.py"
+      responsibility: >
+        캡처된 비디오 프레임에 자막 텍스트를 Pillow/OpenCV로 오버레이하고,
+        결과 프레임을 화면에 표시하거나 파일로 저장하는 단일 책임을 가짐.
+        프레임 드롭 감지 및 버퍼 상태 모니터링 포함.
+      key_functions:
+        - "VideoCompositor.__init__(config): OpenCV 창 및 Pillow 폰트 초기화"
+        - "VideoCompositor.composite(video_frame, subtitle_event) -> np.ndarray: 자막 오버레이 적용"
+        - "VideoCompositor._draw_text_pil(image, text, position, style): Pillow로 한글 텍스트 렌더링"
+        - "VideoCompositor.display(frame): OpenCV imshow로 화면 출력"
+        - "VideoCompositor.detect_frame_drop(frame_id, expected_id) -> bool: 프레임 드롭 감지"
+        - "VideoCompositor.get_buffer_status() -> BufferStatus: 비디오 큐 깊이 및 지연 반환"
+        - "VideoCompositor.update_style(config): 폰트/색상/위치 핫스왑"
+      interfaces:
+        BufferStatus: "{queue_depth: int, max_depth: int, drop_count: int, drop_rate: float}"
+
+    - name: "LatencyTrackerModule"
+      file: "src/metrics/latency_tracker.py"
+      responsibility: >
+        파이프라인 각 단계(캡처, 전송, 수신, 표시)의 타임스탬프를 기록하고
+        지연시간 통계(평균/최소/최대/P95)를 계산하여 메트릭 저장소에 기록하는
+        단일 책임을 가짐.
+      key_functions:
+        - "LatencyTracker.record_capture(packet_id, timestamp_ns): 캡처 시점 기록"
+        - "LatencyTracker.record_stt_send(packet_id, timestamp_ns): STT 전송 시점 기록"
+        - "LatencyTracker.record_stt_receive(result_id, packet_id, timestamp_ns, result_type): 수신 시점 기록"
+        - "LatencyTracker.record_display(result_id, timestamp_ns): 화면 표시 시점 기록"
+        - "LatencyTracker.compute_stats(window_sec=60) -> LatencyStats: 통계 계산"
+        - "LatencyTracker.get_e2e_latency(result_id) -> float: 단일 결과의 end-to-end 지연 반환"
+        - "LatencyTracker.export_csv(filepath): 전체 기록 CSV 저장"
+      interfaces:
+        LatencyStats:
+          "{stage: str, count: int, mean_ms: float, min_ms: float,
+            max_ms: float, p95_ms: float, p99_ms: float}"
+
+    - name: "AccuracyEvaluatorModule"
+      file: "src/metrics/accuracy_evaluator.py"
+      responsibility: >
+        STT final 결과와 레퍼런스 텍스트를 비교하여 WER/CER을 계산하고
+        정확도 리포트를 생성하는 단일 책임을 가짐.
+      key_functions:
+        - "AccuracyEvaluator.__init__(reference_source): 레퍼런스 소스(파일 또는 실시간 입력) 초기화"
+        - "AccuracyEvaluator.load_reference_file(filepath): 레퍼런스 텍스트 파일 로드"
+        - "AccuracyEvaluator.compute_wer(hypothesis, reference) -> float: WER 계산 (jiwer 라이브러리)"
+        - "AccuracyEvaluator.compute_cer(hypothesis, reference) -> float: CER 계산 (문자 단위 편집거리)"
+        - "AccuracyEvaluator.accumulate(stt_result): 누적 WER/CER 업데이트"
+        - "AccuracyEvaluator.generate_report() -> AccuracyReport: 세션 전체 리포트 생성"
+        - "AccuracyEvaluator.save_report(filepath, format='json'): JSON/CSV 리포트 저장"
+      interfaces:
+        AccuracyReport:
+          "{session_id: str, duration_sec: float, total_words: int,
+            total_chars: int, wer: float, cer: float,
+            error_details: list[{hypothesis: str, reference: str, wer: float}]}"
+
+    - name: "DashboardModule"
+      file: "src/dashboard/tui_dashboard.py"
+      responsibility: >
+        Textual 라이브러리를 사용하여 터미널에서 실시간 파이프라인 상태,
+        지연시간 통계, 오디오 레벨, 자막 내용을 시각적으로 표시하는
+        단일 책임을 가짐.
+      key_functions:
+        - "Dashboard.__init__(metrics_store): 메트릭 저장소 참조 초기화"
+        - "Dashboard.start(): Textual 앱 비동기 시작"
+        - "Dashboard.update_latency(stats): 지연시간 패널 갱신 (1초 주기)"
+        - "Dashboard.update_audio_level(rms, peak): 오디오 미터 갱신 (100ms 주기)"
+        - "Dashboard.update_subtitle(text, is_partial): 자막 패널 갱신"
+        - "Dashboard.update_stt_status(connected, error_count): STT 연결 상태 갱신"
+        - "Dashboard.update_frame_stats(drop_rate, buffer_status): 프레임 통계 갱신"
+        - "Dashboard.send_alert(level, message): 경고/오류 알림 표시 (ERROR/WARNING/INFO)"
+
+    - name: "ConfigManagerModule"
+      file: "src/config/config_manager.py"
+      responsibility: >
+        YAML 설정 파일을 로드하고, 파일 변경 감지(watchdog)를 통해 서비스 중단 없이
+        런타임 파라미터를 업데이트하며, 각 모듈에 설정 변경을 통보하는
+        단일 책임을 가짐.
+      key_functions:
+        - "ConfigManager.load(filepath) -> AppConfig: YAML 파일 파싱 및 유효성 검증"
+        - "ConfigManager.watch(filepath): watchdog으로 파일 변경 감시 시작"
+        - "ConfigManager.get(key, default): 설정값 조회 (dot-notation 지원)"
+        - "ConfigManager.subscribe(callback): 설정 변경 시 콜백 등록"
+        - "ConfigManager._on_file_changed(event): 파일 변경 감지 → 리로드 → 구독자 통보"
+        - "ConfigManager.validate_schema(config) -> bool: Pydantic 모델로 스키마 검증"
+
+  data_flow: |
+    [SDI 신호 / 파일 시뮬레이션]
+        │
+        ▼
+    CaptureModule
+        │ VideoFrame(bytes, timestamp_ns) ──────────────────────────────────────┐
+        │ AudioPacket(bytes, 48kHz/24bit, timestamp_ns)                         │
+        ▼                                                                        │
+    AudioResamplerModule                                                         │
+        │ PCMChunk(bytes, 16kHz/16bit/mono, chunk_id, capture_timestamp_ns)     │
+        │ RMS/Peak 수치 → MetricsStore                                           │
+        ▼                                                                        │
+    STTStreamerModule                                                             │
+        │ [gRPC 전송] send_timestamp_ns 기록 → LatencyTracker                   │
+        │ [gRPC 수신] STTResult(text, type, receive_timestamp_ns)                │
+        ▼                                                                        │
+    SubtitleManagerModule                                                         │
+        │ SubtitleEvent(text, display_at_ns, style)                              │
+        │ SRT/VTT 파일 저장                                                      │
+        │ AccuracyEvaluator에 final result 전달                                  │
+        ▼                                                                        │
+    VideoCompositorModule  ◀─────────────────────────────────────────────────────┘
+        │ composite(VideoFrame + SubtitleEvent) → np.ndarray
+        │ display_timestamp_ns → LatencyTracker
+        ▼
+    [OpenCV 프리뷰 / 파일 저장]
+
+    [모든 모듈] → MetricsStore(공유 메모리) → DashboardModule(1초 주기 폴링)
+    [ConfigManager] → 변경 감지 → 각 모듈 콜백 호출 (핫스왑)
+
+  external_dependencies:
+    - name: "grpcio"
+      version: ">=1.60.0"
+      reason: "Clova Speech gRPC 클라이언트 통신"
+    - name: "grpcio-tools"
+      version: ">=1.60.0"
+      reason: "Clova Speech proto 파일 컴파일 (개발 시)"
+    - name: "numpy"
+      version: ">=1.26.0"
+      reason: "오디오 PCM 데이터 배열 연산 및 리샘플링"
+    - name: "scipy"
+      version: ">=1.11.0"
+      reason: "오디오 리샘플링 (scipy.signal.resample_poly)"
+    - name: "opencv-python"
+      version: ">=4.8.0"
+      reason: "비디오 프레임 처리 및 프리뷰 출력"
+    - name: "Pillow"
+      version: ">=10.0.0"
+      reason: "한글 폰트 렌더링 (OpenCV 기본 폰트 한글 미지원)"
+    - name: "webrtcvad"
+      version: ">=2.0.10"
+      reason: "VAD(Voice Activity Detection) - WebRTC 기반 음성 구간 검출"
+    - name: "jiwer"
+      version: ">=3.0.0"
+      reason: "WER(Word Error Rate) 계산"
+    - name: "textual"
+      version: ">=0.47.0"
+      reason: "터미널 TUI 대시보드 (리치한 터미널 UI)"
+    - name: "rich"
+      version: ">=13.7.0"
+      reason: "터미널 출력 포맷팅 및 로그 출력"
+    - name: "pydantic"
+      version: ">=2.5.0"
+      reason: "설정 스키마 유효성 검증 및 타입 안전성"
+    - name: "watchdog"
+      version: ">=3.0.0"
+      reason: "설정 파일 변경 감지 (핫스왑)"
+    - name: "pyyaml"
+      version: ">=6.0.1"
+      reason: "YAML 설정 파일 파싱"
+    - name: "soundfile"
+      version: ">=0.12.1"
+      reason: "테스트 모드 WAV 파일 읽기"
+    - name: "sounddevice"
+      version: ">=0.4.6"
+      reason: "테스트 모드 오디오 재생 모니터링"
+    - name: "prometheus-client"
+      version: ">=0.19.0"
+      reason: "Phase 3 메트릭 외부 수집 (Prometheus 연동)"
+    - name: "fastapi"
+      version: ">=0.109.0"
+      reason: "Phase 3 웹 UI 백엔드 API 서버"
+    - name: "uvicorn"
+      version: ">=0.27.0"
+      reason: "Phase 3 FastAPI ASGI 서버"
+
+################################################################################
+# 3. 파일/디렉토리 구조
+################################################################################
+
+project_structure: |
+  subtitle/
+  ├── main.py                          # 진입점: 파이프라인 오케스트레이터
+  ├── config.yaml                      # 기본 설정 파일
+  ├── requirements.txt
+  ├── requirements-dev.txt
+  ├── proto/
+  │   └── clova_speech.proto           # Clova Speech gRPC proto 파일
+  ├── src/
+  │   ├── __init__.py
+  │   ├── capture/
+  │   │   ├── __init__.py
+  │   │   ├── decklink_capture.py      # DeckLink SDK ctypes 바인딩 + 캡처
+  │   │   ├── decklink_bindings.py     # DeckLink C API ctypes 정의
+  │   │   └── file_mock_capture.py     # 파일 기반 시뮬레이션 캡처
+  │   ├── audio/
+  │   │   ├── __init__.py
+  │   │   ├── resampler.py             # PCM 리샘플링 + 게인 + VAD
+  │   │   └── vad_filter.py            # WebRTC VAD 래퍼
+  │   ├── stt/
+  │   │   ├── __init__.py
+  │   │   ├── clova_streamer.py        # gRPC 스트리밍 클라이언트
+  │   │   ├── clova_speech_pb2.py      # proto 컴파일 결과
+  │   │   └── clova_speech_pb2_grpc.py # proto 컴파일 결과
+  │   ├── subtitle/
+  │   │   ├── __init__.py
+  │   │   ├── subtitle_manager.py      # 자막 결정 로직 + 히스토리
+  │   │   └── subtitle_exporter.py     # SRT/VTT 파일 저장
+  │   ├── compositor/
+  │   │   ├── __init__.py
+  │   │   └── video_compositor.py      # OpenCV + Pillow 오버레이
+  │   ├── metrics/
+  │   │   ├── __init__.py
+  │   │   ├── latency_tracker.py       # 단계별 지연시간 추적
+  │   │   ├── accuracy_evaluator.py    # WER/CER 계산
+  │   │   └── metrics_store.py         # 공유 메트릭 저장소 (thread-safe)
+  │   ├── dashboard/
+  │   │   ├── __init__.py
+  │   │   ├── tui_dashboard.py         # Textual TUI 대시보드
+  │   │   └── web_dashboard.py         # Phase 3: FastAPI 웹 대시보드
+  │   └── config/
+  │       ├── __init__.py
+  │       ├── config_manager.py        # 설정 로드 + 핫스왑
+  │       └── schema.py                # Pydantic 설정 스키마 정의
+  ├── tests/
+  │   ├── unit/
+  │   │   ├── test_resampler.py
+  │   │   ├── test_stt_streamer.py
+  │   │   ├── test_subtitle_manager.py
+  │   │   └── test_accuracy_evaluator.py
+  │   ├── integration/
+  │   │   ├── test_pipeline_file_mode.py    # 파일 시뮬레이션 전체 파이프라인
+  │   │   └── test_stt_live.py              # 실제 Clova API 연동 테스트
+  │   └── fixtures/
+  │       ├── sample_audio.wav              # 테스트용 16kHz WAV 파일
+  │       └── reference_text.txt            # WER 측정용 레퍼런스 텍스트
+  ├── output/
+  │   ├── subtitles/                        # SRT/VTT 자막 파일 저장
+  │   ├── reports/                          # 정확도/지연시간 리포트
+  │   └── logs/                             # 구조화 로그 파일
+  └── docs/
+      └── api_reference.md
+
+################################################################################
+# 4. 설정 스키마 (config.yaml)
+################################################################################
+
+config_schema:
+  description: "config.yaml 전체 구조 및 기본값"
+  content: |
+    # SDI-RealtimeSubtitle 설정 파일
+    # 모든 값은 환경변수로 오버라이드 가능 (PREFIX: SRS_)
+    # 예: SRS_STT_API_KEY=xxx
+
+    system:
+      mode: "live"                    # "live" | "file" (테스트 모드)
+      log_level: "INFO"               # DEBUG | INFO | WARNING | ERROR
+      log_format: "json"              # "json" | "text"
+      log_dir: "output/logs"
+      session_id: ""                  # 비어있으면 자동생성 (UUID)
+
+    capture:
+      device_index: 0                 # DeckLink 장치 인덱스
+      video_mode: "1080p30"           # 1080i50 | 1080p30 | 1080p25 | 720p60
+      pixel_format: "yuv422"          # yuv422 | bgra
+      audio_channels: [1, 2]          # 사용할 SDI 임베디드 채널 번호 (1~8)
+      audio_sample_rate: 48000        # SDI 원본 샘플링레이트 (Hz)
+      audio_bit_depth: 24             # SDI 원본 비트뎁스
+      video_queue_size: 30            # 비디오 큐 최대 프레임 수
+      audio_queue_size: 100           # 오디오 큐 최대 패킷 수
+
+      # 테스트 모드 설정 (mode: "file" 일 때 사용)
+      test_file:
+        audio_path: "tests/fixtures/sample_audio.wav"
+        video_path: ""                # 비어있으면 검정 배경 생성
+        loop: false                   # 파일 반복 재생
+        playback_speed: 1.0           # 재생 속도 (1.0 = 실시간)
+
+    audio:
+      output_sample_rate: 16000       # STT 입력 샘플링레이트 (Hz)
+      output_bit_depth: 16            # STT 입력 비트뎁스
+      output_channels: 1              # mono
+      gain_db: 0.0                    # 게인 조정 (dB, -20.0 ~ +20.0)
+      chunk_size_ms: 100              # STT 전송 청크 크기 (밀리초)
+      vad:
+        enabled: true
+        mode: 3                       # WebRTC VAD 공격성 (0~3, 3=가장 공격적)
+        padding_ms: 300               # 음성 종료 후 추가 패딩 (ms)
+
+    stt:
+      endpoint: "clovaspeech-gw.ncloud.com:50051"
+      api_key: ""                     # 환경변수 SRS_STT_API_KEY 사용 권장
+      secret_key: ""                  # 환경변수 SRS_STT_SECRET_KEY 사용 권장
+      language: "ko-KR"               # ko-KR | en-US | ja-JP
+      domain: "general"               # general | finance | medical
+      model: "general"                # 사용 가능한 모델 식별자
+      use_ssl: true
+      timeout_sec: 30
+      max_reconnect_attempts: 5
+      reconnect_backoff_base_sec: 1   # 재연결 backoff: 1, 2, 4, 8, 16초
+      reconnect_backoff_max_sec: 16
+      result_queue_size: 50
+
+    subtitle:
+      show_partial: true              # partial 결과 표시 여부
+      partial_update_interval_ms: 200 # partial 갱신 주기 (ms)
+      sync_offset_ms: 0               # 자막 표시 시점 오프셋 (양수=지연, 음수=앞당김)
+      display_duration_ms: 3000       # final 자막 표시 유지 시간 (ms)
+      history_size: 100               # 자막 히스토리 버퍼 크기
+      font:
+        path: "/System/Library/Fonts/AppleSDGothicNeo.ttc"   # macOS 기본 한글 폰트
+        size: 36
+        color: "#FFFFFF"              # 텍스트 색상 (HEX)
+        background_color: "#00000080" # 배경 색상 (HEX + 투명도)
+        stroke_color: "#000000"
+        stroke_width: 2
+      position:
+        x: 0.5                        # 가로 위치 (0.0~1.0, 0.5=중앙)
+        y: 0.85                       # 세로 위치 (0.0~1.0, 0.85=하단)
+        anchor: "center"              # center | left | right
+      export:
+        enabled: true
+        format: ["srt", "vtt"]        # 저장 포맷
+        output_dir: "output/subtitles"
+
+    accuracy:
+      enabled: false                  # WER/CER 측정 활성화
+      reference_source: "file"        # "file" | "realtime"
+      reference_file: ""              # reference_source: file 일 때 경로
+      report_interval_sec: 60         # 중간 리포트 출력 주기
+      output_dir: "output/reports"
+
+    metrics:
+      latency_window_sec: 60          # 지연시간 통계 계산 윈도우 (초)
+      metrics_output_dir: "output/reports"
+      prometheus:
+        enabled: false                # Phase 3
+        port: 9090
+
+    dashboard:
+      type: "tui"                     # "tui" | "web" | "none"
+      refresh_interval_ms: 500        # 대시보드 갱신 주기 (ms)
+      audio_meter_interval_ms: 100    # 오디오 미터 갱신 주기
+      web:                            # Phase 3
+        host: "0.0.0.0"
+        port: 8080
+
+    alerts:
+      stt_error_threshold: 3          # 이 횟수 연속 STT 오류 시 알림
+      frame_drop_rate_threshold: 0.01 # 1% 이상 프레임 드롭 시 알림
+      e2e_latency_alert_ms: 3000      # end-to-end 지연 이 값 초과 시 알림
+      audio_silence_sec: 5            # 이 시간 이상 무음 지속 시 알림
+
+################################################################################
+# 5. 구현 워크플로우 (Phase별)
+################################################################################
+
+phases:
+  - phase: 1
+    name: "핵심 파이프라인 MVP"
+    duration: "3주"
+    goal: "테스트 모드(파일 입력)로 오디오 → STT → 자막 표시 end-to-end 동작 확인"
+    steps:
+      - order: 1
+        name: "프로젝트 초기화 및 설정 모듈 구현"
+        input: "요구사항 명세, 설정 스키마 설계"
+        output: "pyproject.toml, requirements.txt, src/config/schema.py, src/config/config_manager.py"
+        duration_minutes: 120
+        dependencies: []
+        tasks:
+          - "Python 3.11 가상환경 설정"
+          - "디렉토리 구조 생성"
+          - "Pydantic v2 기반 AppConfig 스키마 정의"
+          - "config.yaml 기본값 작성"
+          - "ConfigManager.load() 구현 (YAML 파싱 + 유효성 검증)"
+          - "환경변수 오버라이드 지원 추가"
+        validation:
+          method: "pytest tests/unit/test_config_manager.py"
+          pass_condition: "잘못된 설정 입력 시 ValidationError 발생, 정상 설정 로드 성공"
+
+      - order: 2
+        name: "파일 모의 캡처 모듈 구현"
+        input: "WAV 파일 (tests/fixtures/sample_audio.wav)"
+        output: "src/capture/file_mock_capture.py - FileMockCapture 클래스"
+        duration_minutes: 180
+        dependencies: [1]
+        tasks:
+          - "FileMockCapture 클래스 구현 (soundfile로 WAV 로드)"
+          - "실시간 속도 재생 시뮬레이션 (asyncio.sleep 기반 타이밍)"
+          - "AudioPacket 생성 및 audio_queue에 put"
+          - "검정 배경 VideoFrame 생성 및 video_queue에 put (30fps)"
+          - "DeckLink와 동일한 인터페이스(get_audio_queue, get_video_queue) 노출"
+        validation:
+          method: "pytest tests/unit/test_file_mock_capture.py"
+          pass_condition: "100개 AudioPacket 생성, 각 패킷 간격 100ms ±10ms"
+
+      - order: 3
+        name: "오디오 리샘플러 구현"
+        input: "AudioPacket (48kHz/24bit/stereo)"
+        output: "src/audio/resampler.py - PCMChunk (16kHz/16bit/mono)"
+        duration_minutes: 240
+        dependencies: [1]
+        tasks:
+          - "numpy 기반 24bit → 16bit 변환 (비트 시프트)"
+          - "scipy.signal.resample_poly로 48kHz → 16kHz 리샘플링"
+          - "스테레오 → 모노 믹스다운 (평균)"
+          - "선택 채널 추출 로직 (audio_channels 설정 기반)"
+          - "RMS/Peak 레벨 계산"
+          - "게인 조정 (dB 단위)"
+          - "chunk_size_ms 기반 분할"
+          - "WebRTC VAD 필터 통합 (webrtcvad)"
+        validation:
+          method: "pytest tests/unit/test_resampler.py"
+          pass_condition: "리샘플링 출력 16000Hz 확인, 무음 구간 VAD=False, 음성 구간 VAD=True (95% 이상)"
+
+      - order: 4
+        name: "Clova Speech gRPC STT 스트리머 구현"
+        input: "Clova Speech proto 파일, PCMChunk"
+        output: "src/stt/clova_streamer.py - ClovaSpeechStreamer"
+        duration_minutes: 360
+        dependencies: [1]
+        tasks:
+          - "proto 파일 컴파일 (grpc_tools.protoc)"
+          - "gRPC 채널 생성 및 SSL 설정"
+          - "인증 메타데이터 인터셉터 구현"
+          - "양방향 스트리밍 connect() 구현"
+          - "stream_audio() 비동기 전송 루프"
+          - "_receive_loop() 비동기 수신 루프"
+          - "partial/final 결과 파싱 및 STTResult 생성"
+          - "send_timestamp_ns 기록 (LatencyTracker 연동)"
+          - "_reconnect_with_backoff() 구현 (1→2→4→8→16초, 최대 5회)"
+          - "연결 상태 이벤트 발행"
+        validation:
+          method: "pytest tests/integration/test_stt_live.py (실제 API 키 필요)"
+          pass_condition: "10초 오디오 스트리밍 후 partial 1개 이상, final 1개 이상 수신"
+
+      - order: 5
+        name: "자막 매니저 구현"
+        input: "STTResult (partial/final)"
+        output: "src/subtitle/subtitle_manager.py - SubtitleManager"
+        duration_minutes: 180
+        dependencies: [1]
+        tasks:
+          - "partial 결과 누적 및 갱신 로직"
+          - "final 결과 확정 및 히스토리 버퍼 저장"
+          - "sync_offset_ms 적용 (display_at_ns 계산)"
+          - "display_duration_ms 기반 expire_at_ns 계산"
+          - "get_current_subtitle() 현재 시간 기반 활성 자막 반환"
+          - "SRT 포맷 저장 (subtitle_exporter.py)"
+          - "VTT 포맷 저장"
+        validation:
+          method: "pytest tests/unit/test_subtitle_manager.py"
+          pass_condition: "partial→final 전환 정상, sync_offset=500ms 적용 시 display_at 500ms 지연 확인"
+
+      - order: 6
+        name: "비디오 컴포지터 구현"
+        input: "VideoFrame (bytes), SubtitleEvent"
+        output: "src/compositor/video_compositor.py - OpenCV 프리뷰 창"
+        duration_minutes: 240
+        dependencies: [1]
+        tasks:
+          - "VideoFrame bytes → numpy array 변환"
+          - "Pillow 기반 한글 텍스트 렌더링"
+          - "반투명 배경 박스 오버레이"
+          - "OpenCV imshow 프리뷰 출력"
+          - "프레임 드롭 감지 (frame_id 기반)"
+          - "비디오 큐 깊이 모니터링"
+        validation:
+          method: "python -m src.compositor.video_compositor --test"
+          pass_condition: "한글 자막이 정상 렌더링된 프리뷰 창 표시, 1920x1080 처리 30fps 유지"
+
+      - order: 7
+        name: "파이프라인 오케스트레이터 통합"
+        input: "모든 모듈 완성"
+        output: "main.py - 전체 파이프라인 asyncio 실행"
+        duration_minutes: 300
+        dependencies: [2, 3, 4, 5, 6]
+        tasks:
+          - "asyncio.gather로 모든 모듈 태스크 병렬 실행"
+          - "FileMockCapture → AudioResampler → STTStreamer → SubtitleManager → VideoCompositor 연결"
+          - "SIGINT/SIGTERM 핸들러로 graceful shutdown"
+          - "에러 발생 시 파이프라인 재시작 로직"
+          - "시작/종료 로그 JSON 출력"
+        validation:
+          method: "python main.py --mode file --audio tests/fixtures/sample_audio.wav"
+          pass_condition: "30초 오디오 파일 처리 중 자막 표시, 오류 없이 종료"
+
+  - phase: 2
+    name: "측정 및 모니터링"
+    duration: "2주"
+    goal: "지연시간/정확도 측정, TUI 대시보드, 로깅 체계 완성"
+    prerequisite: "Phase 1 완료"
+    steps:
+      - order: 8
+        name: "지연시간 추적 모듈 구현"
+        input: "각 모듈의 timestamp_ns 데이터"
+        output: "src/metrics/latency_tracker.py - LatencyStats JSON"
+        duration_minutes: 300
+        dependencies: [7]
+        tasks:
+          - "LatencyTracker 구현 (thread-safe dict 기반 타임스탬프 저장)"
+          - "각 파이프라인 단계에 record_*() 호출 삽입"
+          - "compute_stats() - numpy로 percentile 계산"
+          - "60초 슬라이딩 윈도우 집계"
+          - "CSV 내보내기"
+          - "MetricsStore 연동"
+        validation:
+          method: "pytest tests/unit/test_latency_tracker.py"
+          pass_condition: "mock 데이터 100개 투입 시 P95 계산 오차 1ms 이하"
+
+      - order: 9
+        name: "WER/CER 정확도 평가 모듈 구현"
+        input: "STTResult(final), 레퍼런스 텍스트 파일"
+        output: "src/metrics/accuracy_evaluator.py - AccuracyReport JSON"
+        duration_minutes: 240
+        dependencies: [5]
+        tasks:
+          - "jiwer 기반 WER 계산"
+          - "문자 단위 편집거리 CER 계산 (editdistance 라이브러리)"
+          - "레퍼런스 파일 파싱 (줄 단위 매핑)"
+          - "누적 WER/CER 계산 (세션 전체)"
+          - "JSON/CSV 리포트 생성"
+          - "60초 주기 중간 리포트 출력"
+        validation:
+          method: "pytest tests/unit/test_accuracy_evaluator.py"
+          pass_condition: "WER=0%인 완벽한 매치 케이스와 WER=100%인 완전 불일치 케이스 정상 계산"
+
+      - order: 10
+        name: "구조화 로깅 체계 구축"
+        input: "모든 모듈 이벤트"
+        output: "output/logs/session_YYYYMMDD_HHMMSS.jsonl"
+        duration_minutes: 180
+        dependencies: [7]
+        tasks:
+          - "Python logging + JSON 포매터 설정 (python-json-logger)"
+          - "모든 모듈 진입/종료 로그 추가"
+          - "오디오 청크 전송 로그 (chunk_id, timestamp, size)"
+          - "STT 결과 수신 로그 (result_id, type, latency_ms)"
+          - "에러 로그 (traceback 포함)"
+          - "로그 파일 로테이션 (100MB 또는 24시간)"
+          - "실시간 콘솔 출력 (INFO 이상)"
+        validation:
+          method: "python main.py --mode file 실행 후 jsonl 파일 확인"
+          pass_condition: "모든 로그 JSON 파싱 가능, 타임스탬프 단조증가 확인"
+
+      - order: 11
+        name: "Textual TUI 대시보드 구현"
+        input: "MetricsStore (공유 메모리)"
+        output: "src/dashboard/tui_dashboard.py - 실시간 터미널 대시보드"
+        duration_minutes: 360
+        dependencies: [8, 9, 10]
+        tasks:
+          - "Textual 앱 레이아웃 설계 (6개 패널)"
+          - "자막 현황 패널 (partial/final 구분 표시)"
+          - "오디오 레벨 미터 패널 (RMS/Peak 바 그래프)"
+          - "지연시간 통계 패널 (평균/P95/최대)"
+          - "STT 연결 상태 패널 (연결/오류/재연결 횟수)"
+          - "프레임 통계 패널 (드롭율, 버퍼 깊이)"
+          - "WER/CER 패널 (활성화 시)"
+          - "500ms 주기 자동 갱신"
+          - "알림 배너 (ERROR/WARNING 이벤트)"
+        validation:
+          method: "python main.py --mode file --dashboard tui"
+          pass_condition: "대시보드 모든 패널 표시, 500ms마다 수치 갱신 확인"
+
+  - phase: 3
+    name: "실제 SDI 연동 및 고급 기능"
+    duration: "2주"
+    goal: "DeckLink SDK 실 연동, 핫스왑 설정, 웹 대시보드"
+    prerequisite: "Phase 2 완료, Blackmagic DeckLink 카드 설치"
+    steps:
+      - order: 12
+        name: "DeckLink SDK ctypes 바인딩 구현"
+        input: "Blackmagic Desktop Video SDK 헤더 파일"
+        output: "src/capture/decklink_bindings.py, src/capture/decklink_capture.py"
+        duration_minutes: 480
+        dependencies: [7]
+        tasks:
+          - "DeckLink SDK COM/C++ API → ctypes 바인딩 정의"
+          - "IDeckLink, IDeckLinkInput, IDeckLinkVideoInputFrame, IDeckLinkAudioInputPacket 인터페이스 바인딩"
+          - "콜백 클래스 구현 (IDeckLinkInputCallback)"
+          - "장치 열거 및 선택 로직"
+          - "비디오/오디오 캡처 시작/중지"
+          - "FileMockCapture와 동일한 인터페이스 준수 확인"
+          - "macOS/Linux 플랫폼별 라이브러리 경로 처리"
+        validation:
+          method: "python -m src.capture.decklink_capture --list-devices"
+          pass_condition: "연결된 DeckLink 장치 목록 출력, SDI 입력 시 AudioPacket/VideoFrame 수신 확인"
+
+      - order: 13
+        name: "핫스왑 설정 기능 구현"
+        input: "config.yaml 런타임 수정"
+        output: "src/config/config_manager.py - watchdog 기반 핫스왑"
+        duration_minutes: 240
+        dependencies: [1]
+        tasks:
+          - "watchdog FileSystemEventHandler 구현"
+          - "파일 변경 시 _on_file_changed() 호출"
+          - "변경된 설정을 Pydantic으로 재검증"
+          - "각 모듈의 update_config(config) 콜백 호출"
+          - "변경 전/후 설정 diff 로깅"
+          - "검증 실패 시 이전 설정 유지 (롤백)"
+          - "핫스왑 허용 항목 vs 재시작 필요 항목 구분"
+        validation:
+          method: "파이프라인 실행 중 config.yaml의 subtitle.font.size 변경"
+          pass_condition: "10초 이내 자막 폰트 크기 변경 반영, 파이프라인 중단 없음"
+
+      - order: 14
+        name: "자동 재연결 강화 및 알림 시스템"
+        input: "STT 연결 오류 이벤트"
+        output: "강화된 reconnect 로직, alerts 발송"
+        duration_minutes: 180
+        dependencies: [4]
+        tasks:
+          - "gRPC 상태 코드별 재연결 전략 세분화"
+          - "exponential backoff 재연결 (최대 5회 후 알림)"
+          - "재연결 성공/실패 이벤트 → Dashboard 알림 패널"
+          - "알림 임계값 설정 기반 조건부 알림"
+          - "무음 감지 (5초 이상 무음) 알림"
+          - "프레임 드롭율 임계값 초과 알림"
+        validation:
+          method: "STT 서버 연결 강제 차단 후 복구 시뮬레이션"
+          pass_condition: "5회 재연결 시도 후 포기 알림, 서버 복구 시 자동 재연결 성공"
+
+      - order: 15
+        name: "웹 대시보드 구현 (Phase 3 선택)"
+        input: "MetricsStore, FastAPI"
+        output: "src/dashboard/web_dashboard.py - 브라우저 기반 실시간 대시보드"
+        duration_minutes: 480
+        dependencies: [11]
+        tasks:
+          - "FastAPI 앱 기본 구조"
+          - "WebSocket 기반 실시간 메트릭 스트리밍"
+          - "자막 현황 REST API"
+          - "Chart.js 기반 지연시간 그래프"
+          - "오디오 레벨 바 그래프"
+          - "Prometheus 메트릭 엔드포인트 (/metrics)"
+        validation:
+          method: "브라우저에서 http://localhost:8080 접속"
+          pass_condition: "모든 패널 표시, 1초 주기 실시간 갱신 확인"
+
+  - phase: 4
+    name: "고급 기능 및 운영 최적화"
+    duration: "3주"
+    goal: "다중 채널, NDI 출력, 성능 최적화, 운영 문서화"
+    prerequisite: "Phase 3 완료"
+    steps:
+      - order: 16
+        name: "다중 오디오 채널 동적 선택"
+        input: "SDI 임베디드 채널 1~8"
+        output: "런타임 채널 전환 기능"
+        duration_minutes: 240
+        dependencies: [12]
+        tasks:
+          - "채널별 독립 오디오 큐 관리"
+          - "핫스왑으로 채널 번호 변경 지원"
+          - "채널 레벨 모니터링 (모든 채널 동시)"
+        validation:
+          method: "채널 1→2 전환 후 자막 연속성 확인"
+          pass_condition: "채널 전환 1초 이내, 자막 끊김 없음"
+
+      - order: 17
+        name: "성능 최적화 및 C++ 확장 검토"
+        input: "프로파일링 결과"
+        output: "최적화된 리샘플러 또는 ctypes 확장"
+        duration_minutes: 480
+        dependencies: [12, 13]
+        tasks:
+          - "cProfile/py-spy로 병목 지점 프로파일링"
+          - "numpy 벡터화 연산으로 리샘플러 최적화"
+          - "필요 시 cffi 기반 C 리샘플러 연동"
+          - "메모리 풀 적용 (버퍼 재사용)"
+          - "asyncio 태스크 우선순위 조정"
+        validation:
+          method: "1시간 연속 실행 후 메모리 누수 및 CPU 사용률 확인"
+          pass_condition: "메모리 증가 시간당 100MB 이하, CPU 평균 50% 이하 (M1 Mac 기준)"
+
+      - order: 18
+        name: "운영 문서화 및 배포 스크립트"
+        input: "전체 구현 코드"
+        output: "README.md, Makefile, install.sh"
+        duration_minutes: 240
+        dependencies: [17]
+        tasks:
+          - "설치 가이드 (macOS/Linux)"
+          - "설정 파라미터 전체 설명"
+          - "테스트 모드 실행 가이드"
+          - "Makefile 타겟 (install, test, run-file, run-live, clean)"
+          - "Docker 컨테이너 (테스트 모드 전용)"
+        validation:
+          method: "클린 환경에서 install.sh 실행 후 테스트 모드 실행"
+          pass_condition: "설치부터 테스트 모드 실행까지 30분 이내"
+
+################################################################################
+# 6. 관리 프레임워크
+################################################################################
+
+management:
+  logging:
+    level: "INFO"
+    format: "JSON (python-json-logger)"
+    output:
+      - "콘솔: INFO 이상, 컬러 포맷 (rich 라이브러리)"
+      - "파일: DEBUG 이상, JSONL 포맷, output/logs/session_{id}.jsonl"
+      - "로테이션: 100MB 또는 24시간마다 새 파일"
+    locations:
+      - "ConfigManager.load(): 설정 로드 완료, 검증 오류"
+      - "CaptureModule.start()/stop(): 캡처 시작/종료, 장치 정보"
+      - "CaptureModule._on_audio_packet(): 매 100번째 패킷마다 (패킷ID, 타임스탬프, 크기)"
+      - "AudioResampler.resample(): 매 50번째 청크마다 (RMS, Peak, VAD 결과)"
+      - "ClovaSpeechStreamer.connect(): 연결 시도, 성공, 실패"
+      - "ClovaSpeechStreamer._receive_loop(): 모든 partial/final 결과 (텍스트, 지연ms)"
+      - "ClovaSpeechStreamer._reconnect_with_backoff(): 각 재연결 시도 (횟수, 대기시간)"
+      - "SubtitleManager.process_result(): 모든 final 결과 (텍스트, sync_offset_ms)"
+      - "VideoCompositor.detect_frame_drop(): 드롭 감지 시 항상"
+      - "LatencyTracker.compute_stats(): 60초마다 통계 요약"
+      - "AccuracyEvaluator.generate_report(): 세션 종료 시"
+    strategy: >
+      모든 로그는 JSON Lines(.jsonl) 포맷으로 저장하여 기계 가독성을 보장.
+      필드 구조: {timestamp_iso, level, module, function, session_id, message, ...extra}.
+      성능 영향 최소화를 위해 DEBUG 로그는 asyncio 큐를 통해 별도 로깅 태스크에서 처리.
+      오류 발생 시 전체 traceback을 error_detail 필드에 포함.
+
+  metrics:
+    - name: "end_to_end_latency_ms"
+      measurement: "캡처 timestamp_ns → 화면 표시 timestamp_ns 차이 (ms 변환)"
+      target: "평균 1,000ms 이하"
+      alert_threshold: "P95 > 2,000ms 시 WARNING, P95 > 3,000ms 시 ERROR"
+
+    - name: "stt_partial_latency_ms"
+      measurement: "PCM 청크 전송 timestamp_ns → partial 수신 timestamp_ns 차이"
+      target: "평균 500ms 이하"
+      alert_threshold: "평균 > 800ms 시 WARNING"
+
+    - name: "stt_final_latency_ms"
+      measurement: "PCM 청크 전송 timestamp_ns → final 수신 timestamp_ns 차이"
+      target: "평균 1,500ms 이하"
+      alert_threshold: "평균 > 2,500ms 시 WARNING"
+
+    - name: "frame_drop_rate"
+      measurement: "드롭된 프레임 수 / 전체 기대 프레임 수 (1분 윈도우)"
+      target: "0.1% 이하"
+      alert_threshold: "> 0.5% 시 WARNING, > 1% 시 ERROR"
+
+    - name: "stt_success_rate"
+      measurement: "STT final 결과 수신 횟수 / STT 전송 세션 수 (1시간 윈도우)"
+      target: "99% 이상"
+      alert_threshold: "< 98% 시 WARNING, < 95% 시 ERROR"
+
+    - name: "audio_queue_depth"
+      measurement: "audio_queue.qsize() / audio_queue_size (비율)"
+      target: "50% 이하"
+      alert_threshold: "> 80% 시 WARNING (버퍼 오버플로우 위험)"
+
+    - name: "wer"
+      measurement: "세션 누적 WER (jiwer 라이브러리, accuracy 활성화 시)"
+      target: "도메인별 목표 설정 필요 (초기 목표: 15% 이하)"
+      alert_threshold: "N/A (측정 전용)"
+
+  error_handling:
+    - error: "DeckLink 장치 없음 또는 연결 끊김"
+      detection: "ctypes 함수 반환코드 S_FALSE 또는 E_FAIL 감지"
+      handling: "오류 로그 출력, 테스트 모드로 자동 폴백 여부는 config.capture.fallback_to_file 설정에 따름"
+      retry_strategy: "5초 간격으로 장치 재감지 시도, 최대 12회 (1분)"
+      fallback: "12회 실패 시 파이프라인 종료 및 운영자 알림"
+
+    - error: "gRPC 연결 실패 (초기 연결)"
+      detection: "grpc.RpcError 예외, status_code=UNAVAILABLE"
+      handling: "재연결 backoff 시작, 대시보드 STT 상태 패널 ERROR 표시"
+      retry_strategy: "exponential backoff: 1s → 2s → 4s → 8s → 16s, 최대 5회"
+      fallback: "5회 실패 시 ERROR 알림, STT 없이 자막 표시 중단 (비디오는 계속 통과)"
+
+    - error: "gRPC 스트림 중단 (운영 중 끊김)"
+      detection: "StopAsyncIteration 또는 grpc.aio.AioRpcError 예외"
+      handling: "현재 partial 자막 유지, 재연결 backoff 즉시 시작"
+      retry_strategy: "exponential backoff: 1s → 2s → 4s → 8s → 16s, 최대 5회"
+      fallback: "5회 실패 시 자막 표시 중단, 오디오 큐 계속 유지 (재연결 성공 시 재개)"
+
+    - error: "오디오 큐 오버플로우"
+      detection: "audio_queue.put_nowait() 시 QueueFull 예외"
+      handling: "가장 오래된 패킷 1개 제거 후 새 패킷 삽입, 드롭 카운터 증가"
+      retry_strategy: "재시도 없음 (즉시 오래된 패킷 폐기)"
+      fallback: "오버플로우 지속 시 오디오 게인 낮추기 또는 chunk_size_ms 증가 권고 알림"
+
+    - error: "비디오 큐 오버플로우 (프레임 드롭)"
+      detection: "video_queue.put_nowait() 시 QueueFull 예외"
+      handling: "가장 오래된 프레임 폐기, frame_drop_count 증가"
+      retry_strategy: "재시도 없음"
+      fallback: "드롭율 > 1% 지속 시 컴포지터 처리 지연 의심 → 자막 렌더링 복잡도 낮추기 권고"
+
+    - error: "리샘플링 실패 (numpy 연산 오류)"
+      detection: "numpy ValueError 또는 scipy 예외"
+      handling: "해당 AudioPacket 스킵, 오류 로그 출력"
+      retry_strategy: "재시도 없음 (패킷 단위 스킵)"
+      fallback: "연속 10개 이상 스킵 시 ERROR 알림"
+
+    - error: "자막 폰트 파일 없음"
+      detection: "Pillow ImageFont.truetype() 예외"
+      handling: "시스템 기본 폰트로 폴백, 한글 깨짐 가능성 경고 로그"
+      retry_strategy: "재시도 없음"
+      fallback: "OpenCV 기본 폰트 사용 (한글 깨짐 허용)"
+
+    - error: "설정 파일 스키마 검증 실패 (핫스왑 중)"
+      detection: "Pydantic ValidationError"
+      handling: "변경 거부, 이전 설정 유지, 오류 내용 대시보드 알림"
+      retry_strategy: "재시도 없음"
+      fallback: "운영자가 설정 수정 후 재저장 시 자동 재시도"
+
+    - error: "SRT/VTT 파일 저장 실패 (디스크 꽉 참 등)"
+      detection: "IOError, OSError 예외"
+      handling: "파일 저장 중단, 메모리 히스토리 버퍼는 유지"
+      retry_strategy: "60초 후 1회 재시도"
+      fallback: "재시도 실패 시 파일 저장 비활성화, 메모리 버퍼만 유지"
+
+################################################################################
+# 7. 단일 장비 테스트 전략
+################################################################################
+
+test_strategy:
+  file_simulation_mode:
+    description: >
+      config.yaml의 system.mode를 'file'로 설정하면 DeckLink SDK 없이
+      WAV 파일을 실시간 스트리밍으로 시뮬레이션하여 전체 파이프라인 검증 가능.
+    steps:
+      - "tests/fixtures/sample_audio.wav 준비 (16kHz 또는 48kHz WAV, 한국어 발화 포함)"
+      - "tests/fixtures/reference_text.txt 준비 (위 오디오의 정답 텍스트)"
+      - "python main.py --mode file --config config.yaml 실행"
+      - "TUI 대시보드에서 자막, 지연시간, WER 실시간 확인"
+      - "output/subtitles/ 디렉토리에서 SRT/VTT 파일 검증"
+      - "output/reports/ 디렉토리에서 정확도 리포트 검증"
+
+  unit_tests:
+    command: "pytest tests/unit/ -v --cov=src --cov-report=html"
+    coverage_target: "80% 이상"
+    key_scenarios:
+      - "리샘플러: 48kHz→16kHz 변환 출력 주파수 검증"
+      - "리샘플러: VAD - 1kHz 사인파(음성 아님)=False, 한국어 WAV=True"
+      - "SubtitleManager: partial→final 전환 시 텍스트 덮어쓰기"
+      - "SubtitleManager: sync_offset=500ms 시 display_at 500ms 지연"
+      - "LatencyTracker: P95 계산 (1000개 샘플로 정확도 검증)"
+      - "AccuracyEvaluator: WER=0% (완벽), WER=100% (완전 불일치)"
+      - "ConfigManager: 잘못된 YAML 로드 시 ValidationError"
+
+  integration_tests:
+    command: "pytest tests/integration/ -v -m 'not live_api'"
+    key_scenarios:
+      - "파일 모드 전체 파이프라인: WAV → 자막 → SRT 파일 생성 (STT mock 사용)"
+      - "핫스왑: 파이프라인 실행 중 config.yaml 수정 → 설정 반영 확인"
+
+  live_api_tests:
+    command: "pytest tests/integration/test_stt_live.py -v -m 'live_api'"
+    requirement: "유효한 Clova Speech API 키 필요 (환경변수 SRS_STT_API_KEY)"
+    key_scenarios:
+      - "10초 한국어 오디오 스트리밍 → partial 1개 이상, final 1개 이상 수신"
+      - "재연결 테스트: 스트림 강제 종료 후 재연결 성공"
+
+  performance_tests:
+    command: "python tests/perf/test_pipeline_perf.py"
+    key_scenarios:
+      - "1시간 연속 실행: 메모리 누수 없음, CPU 안정적"
+      - "1920x1080 30fps 처리: 프레임 드롭율 0.1% 이하"
+
+################################################################################
+# 8. 성능 목표
+################################################################################
+
+performance_targets:
+  latency:
+    capture_to_stt_send: "목표 200ms 이하, 허용 500ms"
+    stt_partial_receive: "목표 500ms 이하, 허용 800ms"
+    stt_final_receive: "목표 1,500ms 이하, 허용 2,500ms"
+    end_to_end: "목표 1,000ms 이하, 허용 2,000ms"
+
+  throughput:
+    video: "1920x1080 30fps 처리 (프레임 드롭 0.1% 이하)"
+    audio: "16kHz 16bit mono 연속 스트리밍 (손실 없음)"
+
+  reliability:
+    stt_success_rate: "99% 이상 (재연결 포함)"
+    continuous_operation: "8시간 무중단"
+
+  resource:
+    cpu: "50% 이하 (Apple M1 또는 Intel i7 기준)"
+    memory: "2GB 이하 (비디오 버퍼 포함)"
+    network: "STT 스트리밍 업스트림 약 256kbps (16kHz/16bit/mono)"
+
+  accuracy:
+    wer_target: "도메인별 목표 (일반 뉴스 한국어: 15% 이하)"
+    cer_target: "일반 한국어 발화: 10% 이하"
+
+################################################################################
+# 9. 검증 체크리스트
+################################################################################
+
+validation:
+  checklist:
+    - step: 1
+      name: "설정 모듈"
+      method: "pytest tests/unit/test_config_manager.py -v"
+      pass_condition: "모든 테스트 통과, 잘못된 설정 ValueError 발생 확인"
+      rollback: "schema.py의 Pydantic 모델에서 해당 필드 Optional로 변경"
+
+    - step: 2
+      name: "파일 모의 캡처"
+      method: "pytest tests/unit/test_file_mock_capture.py -v"
+      pass_condition: "100개 AudioPacket, 패킷 간격 100ms ±10ms"
+      rollback: "asyncio.sleep 타이밍 로직 검토, time.monotonic 기반으로 교체"
+
+    - step: 3
+      name: "오디오 리샘플러"
+      method: "pytest tests/unit/test_resampler.py -v"
+      pass_condition: "출력 샘플레이트 16000Hz, VAD 정확도 95% 이상"
+      rollback: "scipy.signal.resample_poly 파라미터 조정, webrtcvad mode 값 변경"
+
+    - step: 4
+      name: "STT 스트리머"
+      method: "pytest tests/integration/test_stt_live.py::test_basic_streaming"
+      pass_condition: "10초 오디오 처리 후 partial 1개, final 1개 이상 수신"
+      rollback: "proto 파일 재컴파일, gRPC 채널 SSL 설정 확인, API 키 유효성 확인"
+
+    - step: 5
+      name: "자막 매니저"
+      method: "pytest tests/unit/test_subtitle_manager.py -v"
+      pass_condition: "partial→final 전환 정상, sync_offset 적용 확인"
+      rollback: "타임스탬프 계산 로직 검토, ns 단위 일관성 확인"
+
+    - step: 6
+      name: "비디오 컴포지터"
+      method: "python -m src.compositor.video_compositor --test --no-display"
+      pass_condition: "한글 텍스트 PNG 저장 후 육안 검증, 1920x1080 처리 33ms 이하"
+      rollback: "폰트 경로 확인, Pillow 버전 업데이트"
+
+    - step: 7
+      name: "통합 파이프라인 (파일 모드)"
+      method: "python main.py --mode file --duration 30 --no-display"
+      pass_condition: "30초 처리 완료, SRT 파일 생성, 오류 로그 없음"
+      rollback: "각 모듈별 큐 연결 확인, asyncio 태스크 예외 로그 검토"
+
+    - step: 8
+      name: "지연시간 추적"
+      method: "pytest tests/unit/test_latency_tracker.py -v"
+      pass_condition: "P95 계산 오차 1ms 이하, CSV 저장 파일 파싱 가능"
+      rollback: "numpy percentile 계산 로직 확인"
+
+    - step: 9
+      name: "WER/CER 정확도"
+      method: "pytest tests/unit/test_accuracy_evaluator.py -v"
+      pass_condition: "WER=0% 케이스와 WER=100% 케이스 모두 정확한 계산"
+      rollback: "jiwer 버전 확인, 한국어 토크나이저 옵션 조정"
+
+    - step: 10
+      name: "로깅 체계"
+      method: "python main.py --mode file --duration 10 --no-display && python -c \"import json; [json.loads(l) for l in open('output/logs/session_latest.jsonl')]\""
+      pass_condition: "모든 로그 라인 JSON 파싱 성공"
+      rollback: "JSON 포매터 설정 확인, 특수문자 이스케이프 처리"
+
+    - step: 11
+      name: "TUI 대시보드"
+      method: "python main.py --mode file --dashboard tui (30초 수동 확인)"
+      pass_condition: "6개 패널 모두 표시, 500ms마다 수치 갱신"
+      rollback: "Textual 버전 확인, 터미널 ANSI 색상 지원 확인"
+
+    - step: 12
+      name: "DeckLink SDI 연동"
+      method: "python -m src.capture.decklink_capture --list-devices && python main.py --mode live --duration 60"
+      pass_condition: "장치 목록 출력, 60초 실시간 자막 표시"
+      rollback: "Desktop Video 드라이버 버전 확인, ctypes 바인딩 ABI 확인"
+
+    - step: 13
+      name: "핫스왑 설정"
+      method: "파이프라인 실행 중 config.yaml의 subtitle.font.size: 36 → 48 변경"
+      pass_condition: "10초 이내 자막 크기 변경 반영, 파이프라인 중단 없음"
+      rollback: "watchdog 이벤트 핸들러 스레드 안전성 확인"
+
+################################################################################
+# 10. 최종 검증 체크리스트
+################################################################################
+
+design_checklist:
+  core_goal_defined_3_to_5_sentences: true
+  implementation_steps_5_to_10: true       # Phase 1~4 총 18단계 (페이즈별 5~7단계)
+  module_responsibilities_non_overlapping: true
+  logging_strategy_specific: true
+  error_handling_5_or_more: true           # 9개 에러 유형 정의
+  time_estimates_realistic: true
+  ascii_architecture_included: true
+  config_schema_complete: true
+  test_strategy_without_hardware: true
+  phase_based_implementation: true

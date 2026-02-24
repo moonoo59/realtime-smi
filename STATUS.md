@@ -2,7 +2,7 @@
 
 ```
 문서명:    프로젝트 진행 현황 (Project Status Report)
-버전:      1.1.0
+버전:      1.2.0
 작성일:    2026-02-23
 최종 수정: 2026-02-24
 작성자:    Claude Code (Sonnet 4.6)
@@ -15,7 +15,7 @@
 |-------|------------|------------------------|--------------|
 | 1.0.0 | 2026-02-23 | 최초 작성 (Phase 1~2 완료 시점 스냅샷) | Claude Code |
 | 1.1.0 | 2026-02-24 | Phase 3 Step 1~2, 4 완료 반영 (BUG-001~004 수정, 웹 대시보드, 핫스왑 설정) | Claude Code |
-| 1.2.0 | 2026-02-24 | Phase 3 Step 3 완료 (DeckLink SDK ctypes 바인딩, 실 캡처 구현, 38개 테스트 추가) | Claude Code |
+| 1.2.0 | 2026-02-24 | Phase 3 전체 완료 (DeckLink SDK 실 연동, BUG-005~006 수정, 38+6개 테스트 추가) | Claude Code |
 
 ---
 
@@ -31,7 +31,7 @@
 **전체 진행률: 약 80%**
 
 > Phase 1~2는 테스트 통과로 검증 완료.
-> Phase 3 전체 완료 (BUG 수정·웹 대시보드·핫스왑·DeckLink SDK 실 연동).
+> Phase 3 전체 완료 (BUG 수정·웹 대시보드·핫스왑·DeckLink SDK 실 연동·Minor 버그 수정).
 > 현재 테스트: **291 passed, 2 skipped**.
 
 ---
@@ -45,11 +45,11 @@
 | `src/config/schema.py` | Pydantic v2 기반 AppConfig 스키마 정의 | 통과 |
 | `src/config/config_manager.py` | YAML 로드, 환경변수 오버라이드, watchdog 핫스왑 감지 | 통과 |
 | `src/capture/file_mock_capture.py` | WAV 파일 기반 오디오/비디오 모의 캡처 (loop, playback_speed 파라미터 지원) | 통과 |
-| `src/capture/decklink_capture.py` | DeckLink SDK stub (Phase 3 Step 3에서 실 구현 예정) | — |
+| `src/capture/decklink_capture.py` | DeckLink SDK stub (Phase 3 Step 3에서 실 구현 완료) | 통과 |
 | `src/audio/resampler.py` | 48kHz/24bit → 16kHz/16bit/mono 리샘플링, VAD 필터, RMS/Peak 계산, **핫스왑 update_config()** | 통과 |
 | `src/stt/clova_streamer.py` | Clova Speech gRPC 양방향 스트리밍, exponential backoff 재연결 (최대 5회) | 통과 |
 | `src/subtitle/subtitle_manager.py` | partial/final 이벤트 관리, sync_offset 적용, **핫스왑 update_config()** | 통과 |
-| `src/subtitle/subtitle_exporter.py` | SRT/VTT 파일 내보내기 (세션 기준 상대 타임코드) | 통과 |
+| `src/subtitle/subtitle_exporter.py` | SRT/VTT 파일 내보내기 (세션 기준 상대 타임코드, 증분 쓰기) | 통과 |
 | `src/compositor/video_compositor.py` | Pillow 한글 렌더링, OpenCV 오버레이, 프레임 드롭 감지, **핫스왑 update_style()** | 통과 |
 | `main.py` | asyncio 파이프라인 오케스트레이터, **Pipeline.apply_config() 핫스왑 연결** | — |
 
@@ -74,7 +74,7 @@
 ### 2-4. 파이프라인 데이터 흐름 (현재 구현 범위)
 
 ```
-[FileMockCapture / DeckLinkCapture(stub)]
+[FileMockCapture / DeckLinkCapture]
    │ audio_queue           │ video_queue
    ▼                        ▼
 [AudioResampler]         [VideoCompositor] ◀─────────────────┐
@@ -177,7 +177,7 @@ Pillow 내장 `draw.text(..., stroke_width=N, stroke_fill=color)` 파라미터�
 1. `pip install` 불필요 (ctypes 기반)
 2. Blackmagic Desktop Video SDK 12.x 설치
 3. SDI 신호 연결 후 `python3 main.py --mode live --web-dashboard` 실행
-4. http://localhost:8765 에서 오디오/비디오 메트릭 확인
+4. http://localhost:8080 에서 오디오/비디오 메트릭 확인
 
 ---
 
@@ -190,8 +190,8 @@ Pillow 내장 `draw.text(..., stroke_width=N, stroke_fill=color)` 파라미터�
 | ~~BUG-001~004 수정~~ | 완료 | — |
 | ~~웹 대시보드 구현~~ | 완료 | — |
 | ~~핫스왑 설정 완성~~ | 완료 | — |
-| ~~DeckLink SDK 실 연동~~ | **완료** | — |
-| ~~BUG-005, 006 수정 (Minor)~~ | **완료** | — |
+| ~~DeckLink SDK 실 연동~~ | 완료 | — |
+| ~~BUG-005, 006 수정 (Minor)~~ | 완료 | — |
 
 ### Phase 4 잔여 작업
 
@@ -254,16 +254,15 @@ python3 -m pytest tests/ -v
 # 3. 파일 모드로 파이프라인 동작 확인 (STT 없이)
 python3 main.py --mode file --no-stt --no-display --duration 10
 
-# 4. 웹 대시보드 동작 확인 (브라우저에서 http://localhost:8765 접속)
+# 4. 웹 대시보드 동작 확인 (브라우저에서 http://localhost:8080 접속)
 python3 main.py --mode file --no-stt --no-display --web-dashboard --duration 30
 
 # 5. 핫스왑 동작 확인
 #    파이프라인 실행 중 config.yaml의 subtitle.font.size 등을 변경하면
 #    재시작 없이 즉시 반영됨
 
-# 6. 다음 작업: DeckLink SDK 실 연동
-#    파일: src/capture/decklink_capture.py
-#    Blackmagic Desktop Video SDK 12.x 설치 후 진행
+# 6. 다음 작업: Phase 4 (다중 채널 / 운영 최적화)
+#    자세한 내용은 Section 5 참조
 ```
 
 ---

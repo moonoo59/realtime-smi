@@ -169,6 +169,29 @@ _HTML = """<!DOCTYPE html>
   /* WER/CER */
   .accuracy-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
 
+  /* 파이프라인 제어 패널 */
+  .ctrl-panel select,
+  .ctrl-panel input[type=text] {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-size: 13px;
+  }
+  .ctrl-panel button {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    padding: 5px 14px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .ctrl-panel button:hover { opacity: 0.85; }
+  #ctrl-stop { background: var(--red); }
+  #ctrl-status { font-size: 13px; color: var(--text-muted); }
+
   /* 알림 배너 */
   #alerts {
     position: fixed;
@@ -202,6 +225,25 @@ _HTML = """<!DOCTYPE html>
 </header>
 
 <div class="grid">
+  <!-- 파이프라인 제어 패널 -->
+  <div class="panel ctrl-panel" style="grid-column: 1 / -1; margin-bottom: 12px;">
+    <div class="panel-title">파이프라인 제어</div>
+    <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px;">
+      <select id="ctrl-mode">
+        <option value="file">파일 모드</option>
+        <option value="live">라이브 모드</option>
+      </select>
+      <input id="ctrl-audio" type="text" placeholder="오디오/영상 파일 경로 (예: /Users/.../video.avi)" style="flex:1; min-width:300px;">
+      <label><input type="checkbox" id="ctrl-no-stt"> STT 비활성화</label>
+    </div>
+    <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+      <input id="ctrl-secret-key" type="password" placeholder="Clova Secret Key (STT 사용 시 입력)" style="flex:1; min-width:260px;">
+      <button id="ctrl-start" onclick="startPipeline()">▶ 시작</button>
+      <button id="ctrl-stop" onclick="stopPipeline()">■ 중지</button>
+      <span id="ctrl-status">대기 중</span>
+    </div>
+  </div>
+
   <!-- 패널 1: 현재 자막 -->
   <div class="panel" style="grid-column: 1 / -1;">
     <div class="panel-title">현재 자막</div>
@@ -452,10 +494,61 @@ function render(data) {
   setText('acc-cer', acc.pair_count > 0 ? (acc.cer * 100).toFixed(1) + '%' : '—');
   setText('acc-pairs', acc.pair_count ?? 0);
 
+  // 파이프라인 상태
+  if (data.pipeline_status !== undefined) {
+    document.getElementById('ctrl-status').textContent =
+      pipelineStatusMap[data.pipeline_status] || data.pipeline_status;
+  }
+
   // 알림 체크
   const alerts = data.alerts || [];
   alerts.forEach(a => showAlert(a.key, a.message, a.level === 'error'));
 }
+
+// =========================================================================
+// 파이프라인 제어
+// =========================================================================
+const pipelineStatusMap = {
+  'running': '실행 중',
+  'idle': '대기 중',
+  'stopping': '종료 중',
+  'error': '오류',
+  'unavailable': '사용 불가',
+};
+
+async function startPipeline() {
+  const body = {
+    mode: document.getElementById('ctrl-mode').value,
+    audio_path: document.getElementById('ctrl-audio').value,
+    no_stt: document.getElementById('ctrl-no-stt').checked,
+    secret_key: document.getElementById('ctrl-secret-key').value,
+  };
+  const res = await fetch('/api/start', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  document.getElementById('ctrl-status').textContent = data.message;
+}
+
+async function stopPipeline() {
+  const res = await fetch('/api/stop', { method: 'POST' });
+  const data = await res.json();
+  document.getElementById('ctrl-status').textContent = data.message;
+}
+
+// 페이지 로드 시 파이프라인 초기 설정을 폼에 반영
+async function loadInitialConfig() {
+  try {
+    const res = await fetch('/api/config');
+    const cfg = await res.json();
+    if (cfg.no_stt) document.getElementById('ctrl-no-stt').checked = true;
+    const modeEl = document.getElementById('ctrl-mode');
+    if (cfg.mode) modeEl.value = cfg.mode;
+  } catch (e) { /* 무시 */ }
+}
+loadInitialConfig();
 
 // =========================================================================
 // WebSocket 연결 (자동 재연결)
@@ -507,14 +600,17 @@ class WebDashboard:
     MetricsStore를 1초 주기로 폴링하여 WebSocket 클라이언트에게 브로드캐스트합니다.
     """
 
-    def __init__(self, metrics_store, host: str = "0.0.0.0", port: int = 8765) -> None:
+    def __init__(self, metrics_store, pipeline=None, host: str = "0.0.0.0", port: int = 8765, config=None) -> None:
         self._store = metrics_store
+        self._pipeline = pipeline
+        self._config = config
         self._host = host
         self._port = port
         self._clients: Set = set()
         self._app = None
         self._server_task: Optional[asyncio.Task] = None
         self._broadcast_task: Optional[asyncio.Task] = None
+        self._pipeline_task: Optional[asyncio.Task] = None
         self._running = False
         # 알림 중복 방지: {key: last_fired_time_sec}
         self._alert_last: dict[str, float] = {}
@@ -532,7 +628,12 @@ class WebDashboard:
                 "pip install fastapi uvicorn 을 실행하세요."
             )
 
-        # from __future__ import annotations 환경에서 FastAPI가 WebSocket 타입을
+        try:
+            from fastapi import Request as _Request
+        except ImportError:
+            _Request = None  # type: ignore[assignment,misc]
+
+        # from __future__ import annotations 환경에서 FastAPI가 타입을
         # 문자열로 평가할 때 모듈 글로벌 네임스페이스에서 찾을 수 있도록 등록
         import sys as _sys
         _mod = _sys.modules[__name__]
@@ -540,6 +641,8 @@ class WebDashboard:
             _mod.WebSocket = WebSocket  # type: ignore[attr-defined]
         if not hasattr(_mod, "WebSocketDisconnect"):
             _mod.WebSocketDisconnect = WebSocketDisconnect  # type: ignore[attr-defined]
+        if _Request is not None and not hasattr(_mod, "Request"):
+            _mod.Request = _Request  # type: ignore[attr-defined]
 
         app = FastAPI(title="SDI Realtime Subtitle Dashboard", docs_url=None, redoc_url=None)
 
@@ -554,6 +657,63 @@ class WebDashboard:
         @app.get("/api/health")
         async def health():
             return JSONResponse(content={"status": "ok", "ts": time.time()})
+
+        @app.get("/api/status")
+        async def pipeline_status():
+            if self._pipeline is None:
+                return JSONResponse(content={"status": "unavailable"})
+            return JSONResponse(content={"status": self._pipeline.get_status()})
+
+        @app.post("/api/start")
+        async def start_pipeline(request: Request):
+            if self._pipeline is None:
+                return JSONResponse(status_code=400, content={"message": "파이프라인이 없습니다."})
+            if self._pipeline.get_status() == "running":
+                return JSONResponse(status_code=400, content={"message": "파이프라인이 이미 실행 중입니다."})
+
+            body = await request.json()
+            audio_path = body.get("audio_path", "")
+            video_path = body.get("video_path", "")
+            mode = body.get("mode", "file")
+            no_stt = body.get("no_stt", False)
+            secret_key = body.get("secret_key", "")
+
+            # 파이프라인 설정 업데이트 (오디오/비디오 경로, 모드, Secret Key)
+            if self._pipeline._config is not None:
+                from src.config.schema import AppConfig
+                config_dict = self._pipeline._config.model_dump()
+                config_dict["system"]["mode"] = mode
+                if audio_path:
+                    config_dict["capture"]["test_file"]["audio_path"] = audio_path
+                if video_path:
+                    config_dict["capture"]["test_file"]["video_path"] = video_path
+                if secret_key:
+                    config_dict["stt"]["secret_key"] = secret_key
+                self._pipeline._config = AppConfig(**config_dict)
+
+            self._pipeline._no_stt = no_stt
+
+            # 백그라운드 태스크로 파이프라인 실행
+            self._pipeline_task = asyncio.create_task(self._pipeline.run())
+            return JSONResponse(content={"message": "파이프라인 시작됨"})
+
+        @app.post("/api/stop")
+        async def stop_pipeline():
+            if self._pipeline is None:
+                return JSONResponse(status_code=400, content={"message": "파이프라인이 없습니다."})
+            self._pipeline.request_shutdown()
+            return JSONResponse(content={"message": "파이프라인 종료 요청됨"})
+
+        @app.get("/api/config")
+        async def get_config():
+            """현재 파이프라인 초기 설정을 반환합니다 (UI 폼 초기화용)."""
+            if self._pipeline is None:
+                return JSONResponse(content={"no_stt": False, "mode": "file"})
+            cfg = self._pipeline._config
+            return JSONResponse(content={
+                "no_stt": self._pipeline._no_stt,
+                "mode": cfg.system.mode if cfg else "file",
+            })
 
         @app.websocket("/ws/metrics")
         async def ws_endpoint(websocket: WebSocket):
@@ -594,6 +754,7 @@ class WebDashboard:
 
         return {
             "ts": time.time(),
+            "pipeline_status": self._pipeline.get_status() if self._pipeline is not None else "unavailable",
             "subtitle": {
                 "text": subtitle.text,
                 "is_partial": subtitle.is_partial,

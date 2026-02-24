@@ -377,7 +377,8 @@ def test_draw_text_uses_pillow_stroke_param(monkeypatch):
         anchor="center",
     )
 
-    compositor._draw_text_pil(frame, event)
+    bgr_frame = compositor._frame_to_bgr(frame)
+    compositor._draw_text_pil(bgr_frame, event)
 
     # stroke_width=3이어도 draw.text()는 정확히 1번만 호출
     assert len(draw_text_calls) == 1

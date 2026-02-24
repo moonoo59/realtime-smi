@@ -127,14 +127,23 @@ class Pipeline:
         self._subtitle_manager = SubtitleManager(config)
         self._compositor = None
 
+        # 파이프라인 상태
+        self._status: str = "idle"  # "idle" | "running" | "stopping" | "error"
+
         # 종료 이벤트
         self._shutdown_event = asyncio.Event()
 
         # 실행 중 태스크 목록
         self._tasks: list[asyncio.Task] = []
 
+    def get_status(self) -> str:
+        """파이프라인의 현재 상태를 반환합니다."""
+        return self._status
+
     async def run(self) -> None:
         """파이프라인을 시작하고 종료 신호를 기다립니다."""
+        self._status = "running"
+        self._shutdown_event = asyncio.Event()  # 재실행을 위해 이벤트 초기화
         logger.info("파이프라인 초기화 시작")
 
         # 캡처 모듈 초기화
@@ -189,6 +198,7 @@ class Pipeline:
 
         finally:
             await self._shutdown()
+            self._status = "idle"
 
     async def _shutdown(self) -> None:
         """파이프라인을 순서대로 종료합니다."""
@@ -495,20 +505,27 @@ async def _main() -> None:
     # SIGINT/SIGTERM 핸들러 등록 (asyncio-safe 방식)
     loop = asyncio.get_event_loop()
 
-    web_dashboard = None
-    if args.web_dashboard:
-        from src.dashboard.web_dashboard import WebDashboard
-        web_dashboard = WebDashboard(
-            pipeline._metrics_store,
-            port=args.web_port,
-        )
+    # 웹 대시보드 모드에서 메인 루프를 제어하는 종료 이벤트
+    _main_shutdown = asyncio.Event()
 
     def _signal_handler():
         logger.info("종료 시그널 수신")
         pipeline.request_shutdown()
+        _main_shutdown.set()
 
     loop.add_signal_handler(signal.SIGINT, _signal_handler)
     loop.add_signal_handler(signal.SIGTERM, _signal_handler)
+
+    web_dashboard = None
+    if args.web_dashboard:
+        from src.dashboard.web_dashboard import WebDashboard
+        web_dashboard = WebDashboard(
+            metrics_store=pipeline._metrics_store,
+            pipeline=pipeline,
+            config=config,
+            host=config.dashboard.web.host,
+            port=args.web_port,
+        )
 
     # 웹 대시보드 시작
     if web_dashboard:
@@ -516,7 +533,10 @@ async def _main() -> None:
 
     # 파이프라인 실행
     try:
-        if args.duration > 0:
+        if args.web_dashboard:
+            # 웹 대시보드 모드: 파이프라인을 UI에서 시작/중지
+            await _main_shutdown.wait()
+        elif args.duration > 0:
             await asyncio.gather(
                 pipeline.run(),
                 _run_with_timeout(pipeline, args.duration),

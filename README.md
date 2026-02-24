@@ -32,15 +32,31 @@ Clova Speech gRPC 스트리밍 STT를 사용하며, DeckLink SDK를 통해 전�
 ## 설치
 
 ```bash
-# 1. 저장소 클론
+# 저장소 클론
 git clone https://github.com/moonoo59/realtime-smi.git
 cd realtime-smi
+```
 
-# 2. 의존성 설치
+### 1. 가상환경 생성 및 활성화
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+```
+
+### 2. 의존성 설치
+
+```bash
 pip install -r requirements.txt
+pip install -r requirements-dev.txt  # 테스트 실행 시
+```
 
-# 3. 개발용 의존성 설치 (테스트 실행 시)
-pip install -r requirements-dev.txt
+### 3. 환경변수 설정 (API 키)
+
+```bash
+cp .env.example .env
+# .env 파일 열고 SRS_STT_SECRET_KEY 입력
+source .env
 ```
 
 ---
@@ -76,23 +92,19 @@ subtitle:
 
 ## 실행
 
-### 파일 테스트 모드 (장비 없이 동작 확인)
+### 4. 파일 모드 실행 (장비 없이 테스트)
 
 ```bash
-python3 main.py --mode file --no-stt --no-display --duration 10
+python3 main.py --mode file --no-stt --no-display --web-dashboard
+# 브라우저에서 http://localhost:8765 접속
+# 웹 대시보드의 "파이프라인 제어" 패널에서 파일 경로 입력 후 시작
 ```
 
-### 라이브 모드 (DeckLink 장비 연결)
+### 5. 라이브 모드 실행 (DeckLink 장비 연결)
 
 ```bash
-python3 main.py --mode live
-```
-
-### 웹 대시보드 활성화
-
-```bash
-python3 main.py --mode file --no-stt --no-display --web-dashboard --duration 30
-# 브라우저에서 http://localhost:8080 접속
+source .env
+python3 main.py --mode live --web-dashboard
 ```
 
 ---
